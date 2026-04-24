@@ -3,6 +3,9 @@ from pydantic import BaseModel, Field
 from typing import List, Optional, Dict
 import os
 import time
+import json
+
+from openai import OpenAI
 
 
 class Context(BaseModel):
@@ -70,7 +73,11 @@ class AnalyzeResponse(BaseModel):
     manual_review_recommended: bool = False
 
 
-app = FastAPI(title="MeezGo AI Media Analyzer", version="0.2.0")
+app = FastAPI(title="MeezGo AI Media Analyzer", version="0.3.0")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_VISION_MODEL = os.getenv("OPENAI_VISION_MODEL", "gpt-4.1-mini").strip()
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 
 
 def _compute_recommendations(req: AnalyzeRequest) -> Recommendations:
@@ -216,10 +223,12 @@ def _build_inventory(req: AnalyzeRequest) -> Inventory:
         disassembly_flags.append("large_furniture_likely")
 
     packing_complexity = None
-    if num_images >= 10:
-        packing_complexity = "medium"
-    elif num_images >= 15:
+    if num_images >= 15:
         packing_complexity = "high"
+    elif num_images >= 10:
+        packing_complexity = "medium"
+    elif num_images >= 5:
+        packing_complexity = "low"
 
     return Inventory(
         rooms_detected=[],
@@ -312,6 +321,167 @@ def _build_empty_response(req: AnalyzeRequest, fallback_reason: str, analysis_ti
     )
 
 
+def _analyze_with_openai_vision(req: AnalyzeRequest) -> Optional[dict]:
+    if not client:
+        return None
+
+    if not req.image_urls:
+        return None
+
+    image_inputs = []
+    for url in req.image_urls[:8]:
+        image_inputs.append({
+            "type": "input_image",
+            "image_url": url,
+            "detail": "high"
+        })
+
+    prompt = """
+You analyze moving-related photos for a moving estimation backend.
+
+Return JSON only.
+
+Be conservative and practical.
+Do not invent certainty.
+If the visuals are unclear, lower confidence and set manual_review_recommended to true.
+
+You must estimate:
+- likely rooms visible
+- moving-relevant items
+- bulky items
+- fragile items
+- estimated move volume in cubic meters
+- estimated weight range in kg as [min, max]
+- packing complexity
+- likely disassembly needs
+- access difficulty signs
+- recommended moving service level: light, medium, or heavy
+- recommended workers count
+- recommended truck size
+- estimated minutes
+- reasons
+- confidence values between 0 and 1
+"""
+
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "inventory": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "rooms_detected": {"type": "array", "items": {"type": "string"}},
+                    "items_detected": {"type": "array", "items": {"type": "string"}},
+                    "bulky_items": {"type": "array", "items": {"type": "string"}},
+                    "fragile_items": {"type": "array", "items": {"type": "string"}},
+                    "estimated_volume_m3": {"type": ["number", "null"]},
+                    "estimated_weight_kg_range": {
+                        "type": ["array", "null"],
+                        "items": {"type": "number"},
+                        "minItems": 2,
+                        "maxItems": 2
+                    },
+                    "packing_complexity": {
+                        "type": ["string", "null"],
+                        "enum": ["low", "medium", "high", None]
+                    },
+                    "disassembly_flags": {"type": "array", "items": {"type": "string"}},
+                    "access_signals": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": [
+                    "rooms_detected",
+                    "items_detected",
+                    "bulky_items",
+                    "fragile_items",
+                    "estimated_volume_m3",
+                    "estimated_weight_kg_range",
+                    "packing_complexity",
+                    "disassembly_flags",
+                    "access_signals"
+                ]
+            },
+            "recommendations": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "service_type": {
+                        "type": "string",
+                        "enum": ["light", "medium", "heavy"]
+                    },
+                    "truck_size": {"type": ["string", "null"]},
+                    "workers": {"type": ["integer", "null"]},
+                    "estimated_minutes": {"type": ["integer", "null"]},
+                    "load_class": {
+                        "type": ["string", "null"],
+                        "enum": ["light", "medium", "heavy", None]
+                    },
+                    "reasons": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number"},
+                    "recommended_services": {"type": "array", "items": {"type": "string"}}
+                },
+                "required": [
+                    "service_type",
+                    "truck_size",
+                    "workers",
+                    "estimated_minutes",
+                    "load_class",
+                    "reasons",
+                    "confidence",
+                    "recommended_services"
+                ]
+            },
+            "confidence_by_field": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "volume": {"type": "number"},
+                    "weight": {"type": "number"},
+                    "access": {"type": "number"},
+                    "service_type": {"type": "number"}
+                },
+                "required": ["volume", "weight", "access", "service_type"]
+            },
+            "review_flags": {"type": "array", "items": {"type": "string"}},
+            "manual_review_recommended": {"type": "boolean"}
+        },
+        "required": [
+            "inventory",
+            "recommendations",
+            "confidence_by_field",
+            "review_flags",
+            "manual_review_recommended"
+        ]
+    }
+
+    response = client.responses.create(
+        model=OPENAI_VISION_MODEL,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": prompt},
+                    *image_inputs
+                ]
+            }
+        ],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "meezgo_vision_analysis",
+                "schema": schema,
+                "strict": True
+            }
+        }
+    )
+
+    text_output = response.output_text
+    if not text_output:
+        return None
+
+    return json.loads(text_output)
+
+
 @app.post("/analyze", response_model=AnalyzeResponse)
 async def analyze_media(req: AnalyzeRequest, request: Request):
     started = time.time()
@@ -324,16 +494,32 @@ async def analyze_media(req: AnalyzeRequest, request: Request):
 
     try:
         has_media = bool(req.image_urls) or bool(req.video_url)
-
         if not has_media:
             elapsed = int((time.time() - started) * 1000)
             return _build_empty_response(req, "no_media", elapsed)
 
-        rec = _compute_recommendations(req)
-        inventory = _build_inventory(req)
-        confidence_by_field = _build_confidence_by_field(req, rec)
-        review_flags = _build_review_flags(req, rec, inventory)
-        manual_review = _manual_review_needed(rec, review_flags)
+        vision_result = None
+        if req.image_urls:
+            try:
+                vision_result = _analyze_with_openai_vision(req)
+            except Exception:
+                vision_result = None
+
+        if vision_result:
+            rec_data = vision_result.get("recommendations", {}) or {}
+            inventory_data = vision_result.get("inventory", {}) or {}
+            confidence_by_field = vision_result.get("confidence_by_field", {}) or {}
+            review_flags = vision_result.get("review_flags", []) or []
+            manual_review = bool(vision_result.get("manual_review_recommended", False))
+
+            rec = Recommendations(**rec_data)
+            inventory = Inventory(**inventory_data)
+        else:
+            rec = _compute_recommendations(req)
+            inventory = _build_inventory(req)
+            confidence_by_field = _build_confidence_by_field(req, rec)
+            review_flags = _build_review_flags(req, rec, inventory)
+            manual_review = _manual_review_needed(rec, review_flags)
 
         elapsed = int((time.time() - started) * 1000)
 
@@ -343,7 +529,7 @@ async def analyze_media(req: AnalyzeRequest, request: Request):
             source_type=req.meta.source_type or req.mode,
             telemetry=Telemetry(
                 frame_count=req.meta.frame_count or 0,
-                fallback_reason="",
+                fallback_reason="" if vision_result else ("vision_unavailable_or_fallback" if req.image_urls else "video_fallback"),
                 analysis_time_ms=elapsed,
             ),
             inventory=inventory,
