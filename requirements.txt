@@ -2,3 +2,5 @@ fastapi
 uvicorn
 pydantic
 requests
+Pillow
+numpy
